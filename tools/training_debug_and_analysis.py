@@ -279,6 +279,10 @@ def mock_data_iterator(cfg, device, n_iters=5):
     # 小分辨率避免OOM (原始928x1600太大)
     H, W = 256, 416
     num_gt = 5
+    past_steps = cfg.get('past_steps', 4)
+    fut_steps = cfg.get('fut_steps', 4)
+    # 模型预测 past_steps+fut_steps 步轨迹, GT必须匹配
+    traj_steps = past_steps + fut_steps
     bev_h = cfg.model.pts_bbox_head.get('bev_h', 200)
     bev_w = cfg.model.pts_bbox_head.get('bev_w', 200)
     num_pts = 10000  # 减少点云数
@@ -312,8 +316,9 @@ def mock_data_iterator(cfg, device, n_iters=5):
             gt_boxes.append(LiDARInstance3DBoxes(boxes_np, box_dim=9))
             gt_labels.append(torch.randint(0, 10, (num_gt,), device=device))
             gt_inds.append(torch.arange(1, num_gt + 1, device=device))
-            gt_past_traj.append(torch.randn(num_gt, 4, 2, device=device))
-            gt_past_traj_mask.append(torch.ones(num_gt, 4, device=device))
+            # 模型past_traj_reg_branches输出shape=[N, past_steps+fut_steps, 2]
+            gt_past_traj.append(torch.randn(num_gt, traj_steps, 2, device=device))
+            gt_past_traj_mask.append(torch.ones(num_gt, traj_steps, 2, device=device))
             sdc_np = torch.randn(1, 9).numpy()
             gt_sdc_bbox.append(LiDARInstance3DBoxes(sdc_np, box_dim=9))
             gt_sdc_label.append(torch.zeros(1, dtype=torch.long, device=device))
