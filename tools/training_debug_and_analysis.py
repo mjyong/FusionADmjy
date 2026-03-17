@@ -488,10 +488,8 @@ def main():
     if args.profile:
         patch_timing(model, timer)
 
-    # --- Step 6: 训练循环 (AMP混合精度) ---
-    use_amp = torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    print(f"\n[Train] 开始 {args.debug_iters} iters, AMP={use_amp}")
+    # --- Step 6: 训练循环 (FP32, deformable attn不支持FP16) ---
+    print(f"\n[Train] 开始 {args.debug_iters} iters")
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -508,10 +506,9 @@ def main():
 
         timer.start('iter_total')
 
-        # 前向 (AMP)
+        # 前向
         try:
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                losses = model.forward(return_loss=True, **data)
+            losses = model.forward(return_loss=True, **data)
         except Exception as e:
             print(f"  iter {it}: 前向失败 - {e}")
             import traceback; traceback.print_exc()
@@ -520,13 +517,13 @@ def main():
         # Loss
         check_loss_values(losses, it)
 
-        # 反向 (AMP)
+        # 反向
         timer.start('backward')
         optimizer.zero_grad()
         total_loss = sum(v for v in losses.values()
                          if isinstance(v, torch.Tensor) and v.requires_grad)
         try:
-            scaler.scale(total_loss).backward()
+            total_loss.backward()
         except Exception as e:
             print(f"  iter {it}: 反向失败 - {e}")
             import traceback; traceback.print_exc()
@@ -536,20 +533,16 @@ def main():
         # 梯度裁剪
         grad_clip = cfg.optimizer_config.get('grad_clip', None)
         if grad_clip:
-            scaler.unscale_(optimizer)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), **grad_clip)
             print(f"  grad_norm={gn:.2f} (clip={grad_clip['max_norm']})")
 
         # 梯度检查
         if args.check_grad and it == 0:
-            if grad_clip is None:
-                scaler.unscale_(optimizer)
             check_gradient_flow(model)
 
         # 更新
         timer.start('optimizer_step')
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
         timer.end('optimizer_step')
 
         timer.end('iter_total')
