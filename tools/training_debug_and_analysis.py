@@ -263,29 +263,78 @@ def patch_timing(model, timer):
 
 
 # =============================================================================
+# Config覆盖 (mock模式, 减小模型以适应24GB显存)
+# =============================================================================
+
+def override_cfg_for_debug(cfg):
+    """
+    覆盖config中的关键参数, 使模型可在24GB GPU上用mock数据运行。
+    主要缩小: BEV分辨率 200x200->50x50, encoder层数 6->2, queue_length 5->1
+    """
+    # BEV分辨率: 200x200 -> 50x50
+    small_bev_h, small_bev_w = 50, 50
+
+    cfg.queue_length = 1  # 只用1帧, 大幅省显存
+
+    # pts_bbox_head
+    head = cfg.model.pts_bbox_head
+    head.bev_h = small_bev_h
+    head.bev_w = small_bev_w
+
+    # encoder: 6->2 layers
+    head.transformer.encoder.num_layers = 2
+    # decoder: 6->2 layers
+    head.transformer.decoder.num_layers = 2
+
+    # positional encoding
+    head.positional_encoding.row_num_embed = small_bev_h
+    head.positional_encoding.col_num_embed = small_bev_w
+
+    # seg_head
+    if hasattr(cfg.model, 'seg_head') and cfg.model.seg_head is not None:
+        seg = cfg.model.seg_head
+        seg.bev_h = small_bev_h
+        seg.bev_w = small_bev_w
+        seg.canvas_size = (small_bev_h, small_bev_w)
+        # seg encoder/decoder layers
+        if hasattr(seg, 'transformer'):
+            seg.transformer.encoder.num_layers = 2
+            seg.transformer.decoder.num_layers = 2
+
+    # 其它可能引用bev_size的head
+    for head_name in ['motion_head', 'occ_head', 'planning_head']:
+        h = getattr(cfg.model, head_name, None)
+        if h is not None and isinstance(h, dict):
+            if 'bev_size' in h:
+                h['bev_size'] = (small_bev_h, small_bev_w)
+
+    print(f"  [Override] bev={small_bev_h}x{small_bev_w}, "
+          f"encoder=2L, decoder=2L, queue=1")
+    return cfg
+
+
+# =============================================================================
 # Mock数据生成器
 # =============================================================================
 
 def mock_data_iterator(cfg, device, n_iters=5):
     """
     生成与 NuScenesE2EDataset.union2one() collate后格式一致的mock数据。
-    使用小图像(H=256,W=416)和少量点云以避免24GB显存OOM。
+    配合 override_cfg_for_debug() 使用小BEV/小图像以避免24GB显存OOM。
     """
     import numpy as np
     from mmdet3d.core.bbox import LiDARInstance3DBoxes
 
-    queue_length = min(cfg.get('queue_length', 5), 3)  # 限制3帧, 省显存
+    queue_length = cfg.get('queue_length', 1)  # 已被override为1
     num_cams = 6
-    # 小分辨率避免OOM (原始928x1600太大)
-    H, W = 256, 416
-    num_gt = 5
+    H, W = 128, 192  # 极小分辨率
+    num_gt = 3
     past_steps = cfg.get('past_steps', 4)
     fut_steps = cfg.get('fut_steps', 4)
-    # 模型预测 past_steps+fut_steps 步轨迹, GT必须匹配
     traj_steps = past_steps + fut_steps
-    bev_h = cfg.model.pts_bbox_head.get('bev_h', 200)
-    bev_w = cfg.model.pts_bbox_head.get('bev_w', 200)
-    num_pts = 10000  # 减少点云数
+    bev_h = cfg.model.pts_bbox_head.get('bev_h', 50)
+    bev_w = cfg.model.pts_bbox_head.get('bev_w', 50)
+    num_pts = 5000
 
     for _ in range(n_iters):
         metas = {}
@@ -380,6 +429,10 @@ def main():
         _module_path = os.path.dirname(cfg.plugin_dir).replace('/', '.')
         plg_lib = importlib.import_module(_module_path)
 
+    # --- Step 2.5: Mock模式缩小模型 ---
+    if args.no_data:
+        cfg = override_cfg_for_debug(cfg)
+
     # --- Step 3: 构建模型 ---
     from mmdet3d.models import build_model
     device = f'cuda:{args.gpu_id}' if torch.cuda.is_available() else 'cpu'
@@ -435,8 +488,10 @@ def main():
     if args.profile:
         patch_timing(model, timer)
 
-    # --- Step 6: 训练循环 ---
-    print(f"\n[Train] 开始 {args.debug_iters} iters")
+    # --- Step 6: 训练循环 (AMP混合精度) ---
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f"\n[Train] 开始 {args.debug_iters} iters, AMP={use_amp}")
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -453,9 +508,10 @@ def main():
 
         timer.start('iter_total')
 
-        # 前向
+        # 前向 (AMP)
         try:
-            losses = model.forward(return_loss=True, **data)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                losses = model.forward(return_loss=True, **data)
         except Exception as e:
             print(f"  iter {it}: 前向失败 - {e}")
             import traceback; traceback.print_exc()
@@ -464,13 +520,13 @@ def main():
         # Loss
         check_loss_values(losses, it)
 
-        # 反向
+        # 反向 (AMP)
         timer.start('backward')
         optimizer.zero_grad()
         total_loss = sum(v for v in losses.values()
                          if isinstance(v, torch.Tensor) and v.requires_grad)
         try:
-            total_loss.backward()
+            scaler.scale(total_loss).backward()
         except Exception as e:
             print(f"  iter {it}: 反向失败 - {e}")
             import traceback; traceback.print_exc()
@@ -480,16 +536,20 @@ def main():
         # 梯度裁剪
         grad_clip = cfg.optimizer_config.get('grad_clip', None)
         if grad_clip:
+            scaler.unscale_(optimizer)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), **grad_clip)
             print(f"  grad_norm={gn:.2f} (clip={grad_clip['max_norm']})")
 
         # 梯度检查
         if args.check_grad and it == 0:
+            if grad_clip is None:
+                scaler.unscale_(optimizer)
             check_gradient_flow(model)
 
         # 更新
         timer.start('optimizer_step')
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         timer.end('optimizer_step')
 
         timer.end('iter_total')
