@@ -68,6 +68,10 @@ train_gt_iou_threshold=0.3
 
 model = dict(
     type="FusionAD",
+    freeze_track=False,
+    freeze_seg=False,
+    freeze_motion=True,
+    freeze_occ=True,
     gt_iou_threshold=train_gt_iou_threshold,
     queue_length=queue_length,
     use_grid_mask=True,
